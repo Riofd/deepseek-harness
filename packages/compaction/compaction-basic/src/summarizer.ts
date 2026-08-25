@@ -7,7 +7,7 @@
 import type { Context } from '@deepseek-ai/cordis'
 import { contentHasImage, createUserMessage, BlockAssembler, LlmError } from '@deepseek-ai/dsh-llm'
 import type {
-  ContentBlock, FinishReason, GenerateOptions, Message, TokenUsage, ToolSchema,
+  ContentBlock, FinishReason, GenerateOptions, Message, ReasoningEffortId, TokenUsage, ToolSchema,
 } from '@deepseek-ai/dsh-llm'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 
@@ -71,9 +71,9 @@ const CHECKPOINT_PREAMBLE =
 
 /**
  * The replayed conversation surface the summarizer condenses. Reproducing the
- * last routed request's system prompt, tools, and leading messages verbatim
- * lets the auxiliary call reuse the provider's warm prefix cache; the trailing
- * compaction instruction is then the only novel input.
+ * last routed request's system prompt, tools, leading messages, and reasoning
+ * effort verbatim lets the auxiliary call reuse the provider's warm prefix
+ * cache; the trailing compaction instruction is then the only novel input.
  */
 export interface SummarizationInput {
   /** The conversation's own system prompt, reused for prefix-cache alignment; absent for a system-less request. */
@@ -82,6 +82,14 @@ export interface SummarizationInput {
   readonly tools?: readonly ToolSchema[]
   /** The shadowed region, in surface order, that precedes the compaction instruction. */
   readonly messages: readonly Message[]
+  /**
+   * The conversation's routed reasoning effort, reused for prefix-cache
+   * alignment. A provider may key its prefix cache on the resolved wire
+   * thinking/effort fields, so omitting it would let the auxiliary call fall
+   * back to the model default and invalidate the warm prefix; absent when the
+   * conversation request carried no explicit effort.
+   */
+  readonly reasoningEffort?: ReasoningEffortId
 }
 
 /** Safe summary content plus the exact auxiliary call envelope recorded with it. */
@@ -110,10 +118,13 @@ export type SummaryResult = {
 /**
  * Run the default cache-reusing `ctx.llm.stream()` summarization call: replay
  * the conversation prefix, then append the compaction instruction as the final
- * user message so the provider's warm prefix cache is reused.
+ * user message so the provider's warm prefix cache is reused. The routed
+ * reasoning effort is forwarded as well, so the wire thinking/effort fields
+ * match the warm conversation request; a different effort would re-key the
+ * provider-side prefix cache from the head.
  * @param ctx - context providing the LLM service.
  * @param config - resolved backend configuration.
- * @param input - replayed conversation prefix (system, tools, and leading messages) to condense.
+ * @param input - replayed conversation prefix (system, tools, reasoning effort, and leading messages) to condense.
  * @param agent - supplies routed-model history, fallback model, and session id.
  * @param signal - optional cancellation forwarded to the adapter.
  * @returns safe text-only summary blocks and the exact call envelope and output.
@@ -141,6 +152,13 @@ export async function summarizeWithLlm(
       'no provider/model available for summarization: set both BasicCompactionConfig summarization fields, route one request, or set both AgentOptions fields',
     )
   }
+  // The conversation's reasoning effort only aligns the wire when the aux
+  // call targets the exact conversation route. A policy override to a
+  // different provider/model never shares the warm prefix anyway, and its
+  // model may not accept the conversation route's effort; forcing it there
+  // would turn a tolerated cache miss into a request failure.
+  const sameRouteAsConversation = latest !== undefined && latest.provider === target.provider
+    && latest.model === target.model
 
   const assembler = new BlockAssembler()
   const messages: Message[] = [
@@ -156,6 +174,9 @@ export async function summarizeWithLlm(
     messages,
     ...input.system === undefined ? {} : { system: input.system },
     ...input.tools === undefined ? {} : { tools: [...input.tools] },
+    ...input.reasoningEffort === undefined || !sameRouteAsConversation
+      ? {}
+      : { reasoningEffort: input.reasoningEffort },
     maxTokens: config.maxTokens,
     sessionId: agent.session.id,
     purpose: 'compaction',

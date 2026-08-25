@@ -12,7 +12,7 @@ import {
   resolveTargetPolicy,
 } from '@deepseek-ai/dsh-compaction-basic/src/config.ts'
 import type { CompactionResult } from '@deepseek-ai/dsh-compaction'
-import LlmRuntime, { createUserMessage, CallId, CONTEXT_WINDOW_EXCEEDED_CODE, createToolResultMessage, LlmAdapter , createMessage } from '@deepseek-ai/dsh-llm'
+import LlmRuntime, { createUserMessage, CallId, CONTEXT_WINDOW_EXCEEDED_CODE, createToolResultMessage, LlmAdapter , createMessage, ReasoningEffortId } from '@deepseek-ai/dsh-llm'
 import type {
   ContentBlock,
   GenerateOptions,
@@ -884,7 +884,11 @@ describe('compaction region transaction', () => {
     const session = conversation(3)
     const tools = [{ name: 'do_thing', description: 'd', parameters: { type: 'object' } }]
     session.append('request/header', {
-      header: { config: { provider: MODEL, model: MODEL }, system: 'CONVERSATION SYSTEM', tools },
+      header: {
+        config: { provider: MODEL, model: MODEL, reasoningEffort: ReasoningEffortId('high') },
+        system: 'CONVERSATION SYSTEM',
+        tools,
+      },
       reason: 'resume',
     })
     const nodes = session.surface.nodes
@@ -893,6 +897,7 @@ describe('compaction region transaction', () => {
     const { input } = compact.calls[0]!
     expect(input.system).toBe('CONVERSATION SYSTEM')
     expect(input.tools).toEqual(tools)
+    expect(input.reasoningEffort).toBe(ReasoningEffortId('high'))
     expect(summarizedText(input)).toContain('fixture user 1')
   })
 
@@ -1120,6 +1125,24 @@ class ScriptedAdapter extends LlmAdapter {
     super()
   }
 
+  override resolveModel(provider: string, model: string): Promise<LlmResolvedModelInfo> {
+    // Mirror a real reasoning model so an explicitly forwarded effort passes
+    // resolveCallWithInfo validation. No defaultEffort is declared, so a
+    // request without an explicit effort stays unchanged (no injection).
+    return Promise.resolve({
+      provider,
+      id: model,
+      name: model,
+      reasoning: {
+        efforts: [
+          { id: ReasoningEffortId('low'), name: 'Low' },
+          { id: ReasoningEffortId('high'), name: 'High' },
+          { id: ReasoningEffortId('max'), name: 'Max' },
+        ],
+      },
+    })
+  }
+
   override async * stream(options: GenerateOptions): AsyncIterable<StreamChunk> {
     this.lastOptions = options
     for (const [index, block] of this.blocks.entries()) {
@@ -1215,6 +1238,10 @@ describe('default one-shot summarizer', () => {
       sessionId: session.id,
       purpose: 'compaction',
     })
+    // Same route, but the replay carried no explicit effort: the summarizer
+    // must not materialize one; any default stays adapter-side so it matches
+    // the conversation request's own default materialization.
+    expect(adapter.lastOptions).not.toHaveProperty('reasoningEffort')
     const instruction = adapter.lastOptions?.messages.at(-1)?.content[0]
     expect(instruction?.type === 'text' ? instruction.text : '').toContain('## Primary Request and Intent')
   })
@@ -1241,11 +1268,13 @@ describe('default one-shot summarizer', () => {
     await compact.runSummarize({
       system: 'REPLAYED SYSTEM',
       tools,
+      reasoningEffort: ReasoningEffortId('max'),
       messages: [prefix],
     }, agent(conversation(1), MODEL))
 
     expect(adapter.lastOptions?.system).toBe('REPLAYED SYSTEM')
     expect(adapter.lastOptions?.tools).toEqual(tools)
+    expect(adapter.lastOptions?.reasoningEffort).toBe(ReasoningEffortId('max'))
     const messages = adapter.lastOptions?.messages ?? []
     expect(messages[0]).toEqual(prefix)
     const last = messages.at(-1)?.content[0]
@@ -1281,6 +1310,7 @@ describe('default one-shot summarizer', () => {
 
     const output = await compact.runSummarize({
       system: 'WARM SYSTEM',
+      reasoningEffort: ReasoningEffortId('max'),
       messages: [prefix],
     }, agent(conversation(1), 'fallback'))
 
@@ -1296,6 +1326,10 @@ describe('default one-shot summarizer', () => {
       system: 'WARM SYSTEM',
     })
     expect(policyAdapter.lastOptions?.messages[0]).toEqual(prefix)
+    // The policy routes to a different model than the conversation, so the
+    // conversation's effort must not be forwarded onto a model that may not
+    // accept it.
+    expect(policyAdapter.lastOptions).not.toHaveProperty('reasoningEffort')
   })
 
   it('resolves the latest routed provider/model before the AgentOptions pair', async () => {
